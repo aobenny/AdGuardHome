@@ -10,7 +10,9 @@ import (
 
 	"github.com/AdguardTeam/AdGuardHome/internal/dnsforward"
 	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/httphdr"
 	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/netutil/urlutil"
 	"github.com/google/uuid"
 	"howett.net/plist"
 )
@@ -82,7 +84,7 @@ func encodeMobileConfig(d *dnsSettings, clientID string) ([]byte, error) {
 	case dnsProtoHTTPS:
 		dspName = fmt.Sprintf("%s DoH", d.ServerName)
 		u := &url.URL{
-			Scheme: schemeHTTPS,
+			Scheme: urlutil.SchemeHTTPS,
 			Host:   d.ServerName,
 			Path:   path.Join("/dns-query", clientID),
 		}
@@ -169,7 +171,7 @@ func handleMobileConfig(w http.ResponseWriter, r *http.Request, dnsp string) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/xml")
+	w.Header().Set(httphdr.ContentType, "application/xml")
 
 	const (
 		dohContDisp = `attachment; filename=doh.mobileconfig`
@@ -181,7 +183,7 @@ func handleMobileConfig(w http.ResponseWriter, r *http.Request, dnsp string) {
 		contDisp = dotContDisp
 	}
 
-	w.Header().Set("Content-Disposition", contDisp)
+	w.Header().Set(httphdr.ContentDisposition, contDisp)
 
 	_, _ = w.Write(mobileconfig)
 }
