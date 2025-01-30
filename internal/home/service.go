@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/version"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/netutil/urlutil"
 	"github.com/kardianos/service"
 )
 
@@ -33,8 +33,13 @@ const (
 // daemon.
 type program struct {
 	clientBuildFS fs.FS
+	signals       chan os.Signal
+	done          chan struct{}
 	opts          options
 }
+
+// type check
+var _ service.Interface = (*program)(nil)
 
 // Start implements service.Interface interface for *program.
 func (p *program) Start(_ service.Service) (err error) {
@@ -42,19 +47,19 @@ func (p *program) Start(_ service.Service) (err error) {
 	args := p.opts
 	args.runningAsService = true
 
-	go run(args, p.clientBuildFS)
+	go run(args, p.clientBuildFS, p.done)
 
 	return nil
 }
 
 // Stop implements service.Interface interface for *program.
-func (p *program) Stop(_ service.Service) error {
-	// Stop should not block.  Return with a few seconds.
-	if Context.appSignalChannel == nil {
-		os.Exit(0)
-	}
+func (p *program) Stop(_ service.Service) (err error) {
+	log.Info("service: stopping: waiting for cleanup")
 
-	Context.appSignalChannel <- syscall.SIGINT
+	aghos.SendShutdownSignal(p.signals)
+
+	// Wait for other goroutines to complete their job.
+	<-p.done
 
 	return nil
 }
@@ -83,14 +88,9 @@ func svcStatus(s service.Service) (status service.Status, err error) {
 // On OpenWrt, the service utility may not exist.  We use our service script
 // directly in this case.
 func svcAction(s service.Service, action string) (err error) {
-	if runtime.GOOS == "darwin" && action == "start" {
-		var exe string
-		if exe, err = os.Executable(); err != nil {
-			log.Error("starting service: getting executable path: %s", err)
-		} else if exe, err = filepath.EvalSymlinks(exe); err != nil {
-			log.Error("starting service: evaluating executable symlinks: %s", err)
-		} else if !strings.HasPrefix(exe, "/Applications/") {
-			log.Info("warning: service must be started from within the /Applications directory")
+	if action == "start" {
+		if err = aghos.PreCheckActionStart(); err != nil {
+			log.Error("starting service: %s", err)
 		}
 	}
 
@@ -98,8 +98,6 @@ func svcAction(s service.Service, action string) (err error) {
 	if err != nil && service.Platform() == "unix-systemv" &&
 		(action == "start" || action == "stop" || action == "restart") {
 		_, err = runInitdCommand(action)
-
-		return err
 	}
 
 	return err
@@ -158,23 +156,62 @@ func sendSigReload() {
 	log.Debug("service: sent signal to pid %d", pid)
 }
 
+// restartService restarts the service.  It returns error if the service is not
+// running.
+func restartService() (err error) {
+	// Call chooseSystem explicitly to introduce OpenBSD support for service
+	// package.  It's a noop for other GOOS values.
+	chooseSystem()
+
+	pwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getting current directory: %w", err)
+	}
+
+	svcConfig := &service.Config{
+		Name:             serviceName,
+		DisplayName:      serviceDisplayName,
+		Description:      serviceDescription,
+		WorkingDirectory: pwd,
+	}
+	configureService(svcConfig)
+
+	var s service.Service
+	if s, err = service.New(&program{}, svcConfig); err != nil {
+		return fmt.Errorf("initializing service: %w", err)
+	}
+
+	if err = svcAction(s, "restart"); err != nil {
+		return fmt.Errorf("restarting service: %w", err)
+	}
+
+	return nil
+}
+
 // handleServiceControlAction one of the possible control actions:
-// install -- installs a service/daemon
-// uninstall -- uninstalls it
-// status -- prints the service status
-// start -- starts the previously installed service
-// stop -- stops the previously installed service
-// restart - restarts the previously installed service
-// run - this is a special command that is not supposed to be used directly
-// it is specified when we register a service, and it indicates to the app
-// that it is being run as a service/daemon.
-func handleServiceControlAction(opts options, clientBuildFS fs.FS) {
+//
+//   - install:  Installs a service/daemon.
+//   - uninstall:  Uninstalls it.
+//   - status:  Prints the service status.
+//   - start:  Starts the previously installed service.
+//   - stop:  Stops the previously installed service.
+//   - restart:  Restarts the previously installed service.
+//   - run:  This is a special command that is not supposed to be used directly
+//     it is specified when we register a service, and it indicates to the app
+//     that it is being run as a service/daemon.
+func handleServiceControlAction(
+	opts options,
+	clientBuildFS fs.FS,
+	signals chan os.Signal,
+	done chan struct{},
+) {
 	// Call chooseSystem explicitly to introduce OpenBSD support for service
 	// package.  It's a noop for other GOOS values.
 	chooseSystem()
 
 	action := opts.serviceControlAction
-	log.Printf("service: control action: %s", action)
+	log.Info(version.Full())
+	log.Info("service: control action: %s", action)
 
 	if action == "reload" {
 		sendSigReload()
@@ -189,44 +226,67 @@ func handleServiceControlAction(opts options, clientBuildFS fs.FS) {
 
 	runOpts := opts
 	runOpts.serviceControlAction = "run"
+
+	args := optsToArgs(runOpts)
+	log.Debug("service: using args %q", args)
+
 	svcConfig := &service.Config{
 		Name:             serviceName,
 		DisplayName:      serviceDisplayName,
 		Description:      serviceDescription,
 		WorkingDirectory: pwd,
-		Arguments:        serialize(runOpts),
+		Arguments:        args,
 	}
 	configureService(svcConfig)
 
-	prg := &program{
+	s, err := service.New(&program{
 		clientBuildFS: clientBuildFS,
+		signals:       signals,
+		done:          done,
 		opts:          runOpts,
-	}
-	var s service.Service
-	if s, err = service.New(prg, svcConfig); err != nil {
+	}, svcConfig)
+	if err != nil {
 		log.Fatalf("service: initializing service: %s", err)
 	}
 
+	err = handleServiceCommand(s, action, opts)
+	if err != nil {
+		log.Fatalf("service: %s", err)
+	}
+
+	log.Printf(
+		"service: action %s has been done successfully on %s",
+		action,
+		service.ChosenSystem(),
+	)
+}
+
+// handleServiceCommand handles service command.
+func handleServiceCommand(s service.Service, action string, opts options) (err error) {
 	switch action {
 	case "status":
 		handleServiceStatusCommand(s)
 	case "run":
 		if err = s.Run(); err != nil {
-			log.Fatalf("service: failed to run service: %s", err)
+			return fmt.Errorf("failed to run service: %w", err)
 		}
 	case "install":
+		if err = initWorkingDir(opts); err != nil {
+			return fmt.Errorf("failed to init working dir: %w", err)
+		}
+
 		initConfigFilename(opts)
-		initWorkingDir(opts)
+
 		handleServiceInstallCommand(s)
 	case "uninstall":
 		handleServiceUninstallCommand(s)
 	default:
 		if err = svcAction(s, action); err != nil {
-			log.Fatalf("service: executing action %q: %s", action, err)
+			return fmt.Errorf("executing action %q: %w", action, err)
 		}
 	}
 
-	log.Printf("service: action %s has been done successfully on %s", action, service.ChosenSystem())
+	return nil
 }
 
 // handleServiceStatusCommand handles service "status" command.
@@ -246,7 +306,7 @@ func handleServiceStatusCommand(s service.Service) {
 	}
 }
 
-// handleServiceStatusCommand handles service "install" command
+// handleServiceInstallCommand handles service "install" command.
 func handleServiceInstallCommand(s service.Service) {
 	err := svcAction(s, "install")
 	if err != nil {
@@ -276,11 +336,11 @@ AdGuard Home is successfully installed and will automatically start on boot.
 There are a few more things that must be configured before you can use it.
 Click on the link below and follow the Installation Wizard steps to finish setup.
 AdGuard Home is now available at the following addresses:`)
-		printHTTPAddresses(schemeHTTP)
+		printHTTPAddresses(urlutil.SchemeHTTP)
 	}
 }
 
-// handleServiceStatusCommand handles service "uninstall" command
+// handleServiceUninstallCommand handles service "uninstall" command.
 func handleServiceUninstallCommand(s service.Service) {
 	if aghos.IsOpenWrt() {
 		// On OpenWrt it is important to run disable command first
@@ -397,12 +457,12 @@ var launchdConfig = `<?xml version='1.0' encoding='UTF-8'?>
 // the systemdScript constant in file service_systemd_linux.go in module
 // github.com/kardianos/service.  The following changes have been made:
 //
-// 1.  The RestartSec setting is set to a lower value of 10 to make sure we
+//  1. The RestartSec setting is set to a lower value of 10 to make sure we
 //     always restart quickly.
 //
-// 2.  The ExecStartPre setting is added to make sure that the log directory is
-//     always created to prevent the 209/STDOUT errors.
-//
+//  2. The StandardOutput and StandardError settings are set to redirect the
+//     output to the systemd journal, see
+//     https://man7.org/linux/man-pages/man5/systemd.exec.5.html#LOGGING_AND_STANDARD_INPUT/OUTPUT.
 const systemdScript = `[Unit]
 Description={{.Description}}
 ConditionFileIsExecutable={{.Path|cmdEscape}}
@@ -412,7 +472,6 @@ ConditionFileIsExecutable={{.Path|cmdEscape}}
 [Service]
 StartLimitInterval=5
 StartLimitBurst=10
-ExecStartPre=/bin/mkdir -p /var/log/
 ExecStart={{.Path|cmdEscape}}{{range .Arguments}} {{.|cmd}}{{end}}
 {{if .ChRoot}}RootDirectory={{.ChRoot|cmd}}{{end}}
 {{if .WorkingDirectory}}WorkingDirectory={{.WorkingDirectory|cmdEscape}}{{end}}
@@ -420,8 +479,8 @@ ExecStart={{.Path|cmdEscape}}{{range .Arguments}} {{.|cmd}}{{end}}
 {{if .ReloadSignal}}ExecReload=/bin/kill -{{.ReloadSignal}} "$MAINPID"{{end}}
 {{if .PIDFile}}PIDFile={{.PIDFile|cmd}}{{end}}
 {{if and .LogOutput .HasOutputFileSupport -}}
-StandardOutput=file:/var/log/{{.Name}}.out
-StandardError=file:/var/log/{{.Name}}.err
+StandardOutput=journal
+StandardError=journal
 {{- end}}
 {{if gt .LimitNOFILE -1 }}LimitNOFILE={{.LimitNOFILE}}{{end}}
 {{if .Restart}}Restart={{.Restart}}{{end}}
@@ -590,11 +649,6 @@ status() {
 
 // freeBSDScript is the source of the daemon script for FreeBSD.  Keep as close
 // as possible to the https://github.com/kardianos/service/blob/18c957a3dc1120a2efe77beb401d476bade9e577/service_freebsd.go#L204.
-//
-// TODO(a.garipov): Don't use .WorkingDirectory here.  There are currently no
-// guarantees that it will actually be the required directory.
-//
-// See https://github.com/AdguardTeam/AdGuardHome/issues/2614.
 const freeBSDScript = `#!/bin/sh
 # PROVIDE: {{.Name}}
 # REQUIRE: networking
@@ -608,7 +662,9 @@ name="{{.Name}}"
 pidfile_child="/var/run/${name}.pid"
 pidfile="/var/run/${name}_daemon.pid"
 command="/usr/sbin/daemon"
-command_args="-P ${pidfile} -p ${pidfile_child} -T ${name} -r {{.WorkingDirectory}}/{{.Name}}"
+daemon_args="-P ${pidfile} -p ${pidfile_child} -r -t ${name}"
+command_args="${daemon_args} {{.Path}}{{range .Arguments}} {{.}}{{end}}"
+
 run_rc_command "$1"
 `
 

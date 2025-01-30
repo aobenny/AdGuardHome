@@ -16,6 +16,8 @@ import (
 //
 // TODO(a.garipov): Perhaps create an optimized version with uint32 for IPv4
 // ranges?  Or use one of uint128 packages?
+//
+// TODO(e.burkov):  Use netip.Addr.
 type ipRange struct {
 	start *big.Int
 	end   *big.Int

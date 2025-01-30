@@ -1,17 +1,14 @@
 //go:build windows
-// +build windows
 
 package aghos
 
 import (
 	"os"
-	"os/signal"
-	"syscall"
 
 	"golang.org/x/sys/windows"
 )
 
-func setRlimit(val uint64) (err error) {
+func setRlimit(_ uint64) (err error) {
 	return Unsupported("setrlimit")
 }
 
@@ -40,19 +37,6 @@ func isOpenWrt() (ok bool) {
 	return false
 }
 
-func notifyShutdownSignal(c chan<- os.Signal) {
-	// syscall.SIGTERM is processed automatically.  See go doc os/signal,
-	// section Windows.
-	signal.Notify(c, os.Interrupt)
-}
-
-func isShutdownSignal(sig os.Signal) (ok bool) {
-	switch sig {
-	case
-		os.Interrupt,
-		syscall.SIGTERM:
-		return true
-	default:
-		return false
-	}
+func sendShutdownSignal(c chan<- os.Signal) {
+	c <- os.Interrupt
 }
